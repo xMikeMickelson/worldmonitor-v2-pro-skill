@@ -1,6 +1,6 @@
 # Data Sources (Production Matrix)
 
-## Source List (17)
+## Source List (18)
 
 1. USGS — earthquake feed
 2. GDACS — disaster alerts
@@ -13,12 +13,13 @@
 9. U.S. Treasury — rates proxy
 10. USASpending — defense budget references
 11. Open-Meteo climate API — anomaly signal
-12. GDELT — conflict/news velocity
-13. UNHCR — displacement/refugee statistics
-14. Feodo Tracker — C2/botnet infra signal
-15. OpenSky — aviation density in conflict zones
-16. EIA — oil market prices
-17. World Bank — GDP growth enrichment
+12. GDELT ArtList — conflict/news velocity headlines
+13. GDELT Timeline (VolRaw + Tone) — volume/tone regime shifts
+14. UNHCR — displacement/refugee statistics
+15. Feodo Tracker — C2/botnet infra signal
+16. OpenSky — aviation density in conflict zones
+17. EIA — oil market prices
+18. World Bank — GDP growth enrichment
 
 ## Signal Families
 
@@ -31,6 +32,7 @@
 ## Source Reliability Notes
 
 - GDELT and UCDP can be slow/rate-limited; keep graceful degradation paths.
+- TimelineVolRaw/Tone are bursty near breaking events; normalize with `norm` and score via z-sigma windows.
 - Prediction and market feeds can spike; enforce thresholding before escalation.
 - Weather and regional feeds should be configurable by point/country.
 

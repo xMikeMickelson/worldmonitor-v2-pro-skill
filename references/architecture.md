@@ -18,8 +18,9 @@ intel_engine (multi-source pull)
 ## Primary Components
 
 1. **intel_engine.py**
-   - pulls global data from 17 sources
+   - pulls global data from 18 feeds (including GDELT TimelineVolRaw/Tone)
    - computes Country Instability Index for monitored countries
+   - detects volume/tone spike regimes and persists them as `GDELT_TIMELINE` intel stories
    - emits brief/section output and optional DB snapshot writes
 
 2. **event_tracker.py**

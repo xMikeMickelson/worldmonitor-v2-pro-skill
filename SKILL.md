@@ -1,6 +1,6 @@
 ---
 name: worldmonitor-v2-pro
-description: Deploy and operate a production-grade global intelligence + event-lifecycle system (WorldMonitor v2) with multi-source ingestion, Country Instability Index scoring, escalation tracking, follow-up generation, Neon/Postgres history, and cron-driven daily briefing workflows. Use when building or running a world-monitoring map/briefing stack, hardening signal quality, or reproducing an advanced local WorldMonitor setup.
+description: Deploy and operate a production-grade global intelligence + event-lifecycle system (WorldMonitor v2) with 18-source ingestion (incl. GDELT TimelineVolRaw/TimelineTone), Country Instability Index scoring, escalation tracking, follow-up generation, Neon/Postgres history, and cron-driven daily briefing workflows. Use when building or running a world-monitoring map/briefing stack, hardening signal quality, or reproducing an advanced local WorldMonitor setup.
 ---
 
 # worldmonitor-v2-pro
@@ -16,7 +16,7 @@ Run a full production workflow for geopolitical and global-risk monitoring:
 ## Read References On Demand
 
 - System architecture: `references/architecture.md`
-- Data source matrix (17 sources): `references/data-sources.md`
+- Data source matrix (18 feeds): `references/data-sources.md`
 - Deployment/setup workflow: `references/deployment.md`
 - Cron playbooks: `references/cron-playbooks.md`
 - Troubleshooting guide: `references/troubleshooting.md`
@@ -36,6 +36,8 @@ Use the shipped templates in `assets/service-template/`:
 These templates mirror a production WorldMonitor stack, with sanitized path/location knobs:
 - `WORLDMONITOR_DB_ENV_FILE`
 - `WORLDMONITOR_NWS_POINT`
+
+New in this build: `intel_engine.py` includes GDELT TimelineVolRaw/TimelineTone regime detection and persists timeline spikes into `intel_stories` (`sources={GDELT_TIMELINE}`) for downstream model consumers.
 
 ## Setup Steps
 

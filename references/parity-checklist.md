@@ -40,6 +40,7 @@ If additional diffs exist, review before publishing.
 
 ## Data Source Parity
 
-- [ ] all 17 configured sources represented
+- [ ] all 18 configured feeds represented
+- [ ] GDELT TimelineVolRaw/Tone spike detection is active
 - [ ] unavailable source handling is graceful
 - [ ] anomaly/convergence logic remains active

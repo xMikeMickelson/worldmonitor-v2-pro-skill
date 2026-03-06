@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 WorldMonitor v2 Advanced Intelligence Engine
-Pulls from 17 real-time data sources, computes Country Instability Index,
-detects anomalies, tracks history in PostgreSQL, and outputs intelligence briefs.
+Pulls from 18 real-time feeds (including GDELT TimelineVolRaw + TimelineTone),
+computes Country Instability Index, detects anomalies, tracks history in
+PostgreSQL, and outputs intelligence briefs.
 
 Usage:
     python3 intel_engine.py                    # Full JSON output
@@ -17,8 +18,10 @@ Usage:
 import json
 import os
 import sys
+import math
 import urllib.request
 import urllib.error
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any, Dict, List, Tuple
@@ -113,12 +116,14 @@ def fetch_earthquakes() -> List[Dict[str, Any]]:
 
 
 def fetch_gdacs_disasters() -> List[Dict[str, Any]]:
-    """GDACS orange/red disasters (last 7 days)."""
-    data = fetch_json(
-        "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH"
-        "?alertlevel=orange;red&eventlist=EQ;TC;FL;VO;DR&limit=50",
-        "GDACS Disasters"
-    )
+    """GDACS orange/red disasters (last 7 days). Retries once on 503."""
+    import time as _time
+    url = ("https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH"
+           "?alertlevel=orange;red&eventlist=EQ;TC;FL;VO;DR&limit=50")
+    data = fetch_json(url, "GDACS Disasters")
+    if data is None:
+        _time.sleep(3)
+        data = fetch_json(url, "GDACS Disasters (retry)")
     if not data:
         return []
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
@@ -152,8 +157,13 @@ def fetch_gdacs_disasters() -> List[Dict[str, Any]]:
 
 
 def fetch_nasa_events() -> List[Dict[str, Any]]:
-    """NASA EONET active natural events."""
-    data = fetch_json("https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=20", "NASA EONET")
+    """NASA EONET active natural events. Retries once on 503."""
+    import time as _time
+    url = "https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit=20"
+    data = fetch_json(url, "NASA EONET")
+    if data is None:
+        _time.sleep(3)
+        data = fetch_json(url, "NASA EONET (retry)")
     if not data:
         return []
     events = []
@@ -271,19 +281,34 @@ def fetch_nws_alerts() -> List[Dict[str, Any]]:
 
 
 def fetch_ucdp_conflicts() -> List[Dict[str, Any]]:
-    """UCDP armed conflict events (latest year)."""
-    # UCDP API is slow, use a longer timeout
-    try:
-        req = urllib.request.Request(
-            "https://ucdpapi.pcr.uu.se/api/gedevents/24.1?pagesize=50&page=0",
-            headers={"User-Agent": USER_AGENT}
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read())
-    except Exception as e:
-        print(f"  ⚠️ UCDP Conflicts failed: {e}", file=sys.stderr)
-        data = None
-    # data = fetch_json("https://ucdpapi.pcr.uu.se/api/gedevents/24.1?pagesize=100&page=0", "UCDP Conflicts")
+    """UCDP armed conflict events (latest year).
+    NOTE: As of ~Feb 2026, UCDP requires x-ucdp-access-token header.
+    Set UCDP_ACCESS_TOKEN env var or register at https://ucdp.uu.se/apidocs/
+    """
+    ucdp_token = os.environ.get("UCDP_ACCESS_TOKEN", "")
+    headers = {"User-Agent": USER_AGENT}
+    if ucdp_token:
+        headers["x-ucdp-access-token"] = ucdp_token
+    # Try multiple API versions
+    for version in ["24.1", "25.1"]:
+        try:
+            req = urllib.request.Request(
+                f"https://ucdpapi.pcr.uu.se/api/gedevents/{version}?pagesize=50&page=0",
+                headers=headers,
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read())
+            if data and data.get("Result"):
+                break
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and not ucdp_token:
+                print(f"  ⚠️ UCDP requires API token now (set UCDP_ACCESS_TOKEN env). Skipping.", file=sys.stderr)
+                return []
+            print(f"  ⚠️ UCDP v{version} failed: {e}", file=sys.stderr)
+            data = None
+        except Exception as e:
+            print(f"  ⚠️ UCDP v{version} failed: {e}", file=sys.stderr)
+            data = None
     if not data:
         return []
     events = []
@@ -348,23 +373,281 @@ def fetch_open_meteo_climate() -> Dict[str, Any]:
 
 
 def fetch_gdelt_gkg() -> List[Dict[str, Any]]:
-    """GDELT GKG 24h global articles (geopolitical focus)."""
-    # Use a broader query and shorter timespan to avoid 429s
-    data = fetch_json(
-        "https://api.gdeltproject.org/api/v2/doc/doc?query=military+OR+conflict+OR+crisis&mode=ArtList&maxrecords=30&timespan=12h&format=json",
-        "GDELT GKG"
-    )
-    if not data:
-        return []
-    articles = []
-    for article in data.get("articles", []):
-        articles.append({
-            "title": article.get("title"),
-            "url": article.get("url"),
-            "domain": article.get("domain"),
-            "seendate": article.get("seendate"),
+    """GDELT DOC 2.0 ArtList (geopolitical/cyber headlines).
+
+    Docs reference: https://www.gdeltproject.org/data.html#documentation
+
+    Uses DOC 2.0 parameters (query/mode/format/timespan/maxrecords/sort)
+    and rotates multiple focused queries to improve topical coverage while
+    keeping runtime bounded.
+    """
+    import time as _time
+
+    query_specs = [
+        # Core geopolitical escalation
+        ("(military OR conflict OR strike OR ceasefire OR sanctions) sourcelang:english", "3h", 20),
+        # Security + cyber blend (useful for Polymarket conviction context)
+        ("(cyberattack OR ransomware OR malware OR infrastructure attack OR drone strike) sourcelang:english", "6h", 18),
+        # Regional flashpoint terms
+        ("(iran OR israel OR gaza OR ukraine OR taiwan OR \"north korea\") near20:\"military escalation\" sourcelang:english", "6h", 18),
+        # Broad fallback if above are sparse
+        ("(war OR crisis OR mobilization OR deployment) sourcelang:english", "12h", 15),
+    ]
+
+    all_articles: List[Dict[str, Any]] = []
+    seen_titles = set()
+
+    for query, timespan, timeout in query_specs:
+        params = urllib.parse.urlencode({
+            "query": query,
+            "mode": "ArtList",
+            "format": "json",
+            "maxrecords": 40,   # DOC 2.0 supports up to 250
+            "timespan": timespan,
+            "sort": "DateDesc",
         })
-    return articles[:20]
+        url = f"https://api.gdeltproject.org/api/v2/doc/doc?{params}"
+
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
+
+            articles = data.get("articles") if isinstance(data, dict) else None
+            if not articles:
+                continue
+
+            for article in articles:
+                title = (article.get("title") or "").strip()
+                if not title:
+                    continue
+                title_key = title.lower()[:220]
+                if title_key in seen_titles:
+                    continue
+                seen_titles.add(title_key)
+
+                all_articles.append({
+                    "title": title,
+                    "url": article.get("url"),
+                    "domain": article.get("domain"),
+                    "seendate": article.get("seendate") or article.get("seendateutc"),
+                    "sourcecountry": article.get("sourcecountry"),
+                    "source_lang": article.get("language") or article.get("sourcelang"),
+                    "tone": article.get("tone"),
+                })
+
+            # Keep bounded to avoid over-weighting GDELT relative to other sources
+            if len(all_articles) >= 80:
+                break
+
+        except urllib.error.HTTPError as e:
+            # GDELT can rate limit bursty calls; soft backoff and continue
+            print(f"  ⚠️ GDELT DOC ({query[:28]}...) HTTP {e.code}", file=sys.stderr)
+            if e.code == 429:
+                _time.sleep(1.25)
+            continue
+        except Exception as e:
+            print(f"  ⚠️ GDELT DOC ({query[:28]}...) failed: {e}", file=sys.stderr)
+            continue
+
+    return all_articles[:80]
+
+
+def _gdelt_doc_request(query: str, mode: str, timespan: str = "7d", timeout: int = 14) -> Optional[Dict[str, Any]]:
+    """Low-level GDELT DOC 2.0 request helper with light 429 backoff."""
+    import time as _time
+
+    params = urllib.parse.urlencode({
+        "query": query,
+        "mode": mode,
+        "format": "json",
+        "timespan": timespan,
+    })
+    url = f"https://api.gdeltproject.org/api/v2/doc/doc?{params}"
+
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 0:
+                _time.sleep(1.0)
+                continue
+            print(f"  ⚠️ GDELT {mode} failed (HTTP {e.code})", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"  ⚠️ GDELT {mode} failed: {e}", file=sys.stderr)
+            return None
+    return None
+
+
+def _extract_timeline_points(payload: Optional[Dict[str, Any]], normalize_with_norm: bool = False) -> List[Dict[str, Any]]:
+    """Extract timeline points from GDELT timeline responses.
+
+    Supports both flat timeline items and nested series/data structures.
+    """
+    if not payload or not isinstance(payload, dict):
+        return []
+
+    points: List[Dict[str, Any]] = []
+
+    def _append_point(node: Any):
+        if not isinstance(node, dict):
+            return
+        raw_val = node.get("value")
+        try:
+            value = float(raw_val)
+        except (TypeError, ValueError):
+            return
+
+        if normalize_with_norm:
+            try:
+                norm = float(node.get("norm", 0) or 0)
+            except (TypeError, ValueError):
+                norm = 0
+            if norm > 0:
+                value = value / norm
+
+        if not math.isfinite(value):
+            return
+
+        points.append({
+            "date": node.get("date") or node.get("datetime") or node.get("time") or "",
+            "value": value,
+        })
+
+    timeline = payload.get("timeline", [])
+    if not isinstance(timeline, list):
+        return []
+
+    for item in timeline:
+        if isinstance(item, dict) and isinstance(item.get("data"), list):
+            for row in item.get("data", []):
+                _append_point(row)
+        else:
+            _append_point(item)
+
+    return points
+
+
+def _compute_series_stats(points: List[Dict[str, Any]], baseline_window: int = 24) -> Dict[str, float]:
+    """Compute current value, baseline mean/stddev, and z-score."""
+    values = [float(p.get("value", 0)) for p in points if p.get("value") is not None]
+    values = [v for v in values if math.isfinite(v)]
+
+    if len(values) < 3:
+        return {}
+
+    current = values[-1]
+    history = values[:-1]
+    if baseline_window > 0 and len(history) > baseline_window:
+        history = history[-baseline_window:]
+
+    if not history:
+        return {
+            "current": round(current, 6),
+            "baseline": round(current, 6),
+            "stddev": 0.0,
+            "zscore": 0.0,
+        }
+
+    baseline = sum(history) / len(history)
+    variance = sum((x - baseline) ** 2 for x in history) / max(len(history), 1)
+    stddev = math.sqrt(max(variance, 0.0))
+    if stddev <= 1e-12:
+        zscore = 0.0
+    else:
+        zscore = (current - baseline) / stddev
+
+    return {
+        "current": round(current, 6),
+        "baseline": round(baseline, 6),
+        "stddev": round(stddev, 6),
+        "zscore": round(zscore, 3),
+    }
+
+
+def fetch_gdelt_timeline_signals() -> Dict[str, Any]:
+    """Pull GDELT TimelineVolRaw + TimelineTone and detect spike regimes.
+
+    Returns per-region metrics plus extracted spike candidates suitable for
+    downstream Polymarket signal scoring.
+    """
+    import time as _time
+
+    query_specs = [
+        ("Iran", "(iran OR tehran OR khamenei OR irgc)"),
+        ("Russia/Ukraine", "(russia OR ukraine OR moscow OR kyiv OR kremlin)"),
+        ("China/Taiwan", "(china OR taiwan OR beijing OR taipei OR pla)"),
+        ("Middle East", "(israel OR gaza OR hezbollah OR hamas OR lebanon)"),
+        ("Cyber", "(cyberattack OR ransomware OR malware OR critical infrastructure attack)"),
+    ]
+
+    regions: List[Dict[str, Any]] = []
+    spikes: List[Dict[str, Any]] = []
+
+    for region, query in query_specs:
+        vol_payload = _gdelt_doc_request(query, "TimelineVolRaw", timespan="7d", timeout=14)
+        tone_payload = _gdelt_doc_request(query, "TimelineTone", timespan="7d", timeout=14)
+
+        vol_points = _extract_timeline_points(vol_payload, normalize_with_norm=True)
+        tone_points = _extract_timeline_points(tone_payload, normalize_with_norm=False)
+
+        vol_stats = _compute_series_stats(vol_points, baseline_window=24)
+        tone_stats = _compute_series_stats(tone_points, baseline_window=24)
+
+        metric: Dict[str, Any] = {
+            "region": region,
+            "query": query,
+            "volume_points": len(vol_points),
+            "tone_points": len(tone_points),
+            "volume": vol_stats,
+            "tone": tone_stats,
+            "signals": [],
+        }
+
+        vol_z = float(vol_stats.get("zscore", 0.0) or 0.0)
+        tone_z = float(tone_stats.get("zscore", 0.0) or 0.0)
+        tone_current = float(tone_stats.get("current", 0.0) or 0.0)
+
+        signals: List[str] = []
+        if vol_z >= 2.0:
+            signals.append("volume_spike")
+        if tone_z <= -1.5 or (tone_current <= -4.0 and tone_z <= 0.25):
+            signals.append("tone_negative_shift")
+        elif tone_z >= 1.5 or tone_current >= 3.0:
+            signals.append("tone_positive_shift")
+        if vol_z >= 2.0 and (tone_z <= -1.0 or tone_current <= -4.0):
+            signals.append("escalation_combo")
+
+        metric["signals"] = signals
+        regions.append(metric)
+
+        if signals:
+            severity = "high" if (vol_z >= 3.0 or tone_z <= -2.0 or "escalation_combo" in signals) else "moderate"
+            spikes.append({
+                "region": region,
+                "query": query,
+                "signals": signals,
+                "severity": severity,
+                "volume_z": round(vol_z, 3),
+                "tone_z": round(tone_z, 3),
+                "tone_current": round(tone_current, 3),
+                "volume_current": vol_stats.get("current"),
+                "volume_baseline": vol_stats.get("baseline"),
+                "tone_baseline": tone_stats.get("baseline"),
+            })
+
+        # Gentle pacing to reduce 429 risk.
+        _time.sleep(0.2)
+
+    return {
+        "regions": regions,
+        "spikes": spikes,
+        "spike_count": len(spikes),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def fetch_unhcr_displacement() -> Dict[str, Any]:
@@ -784,6 +1067,26 @@ def detect_anomalies(
         names = ", ".join(s["name"] for s in critical[:3])
         anomalies.append(f"CII Critical: {names}")
 
+    # GDELT timeline spike anomalies (volume + tone)
+    gdelt_timeline = current_data.get("gdelt_timeline", {})
+    spikes = gdelt_timeline.get("spikes", []) if isinstance(gdelt_timeline, dict) else []
+    for spike in spikes[:5]:
+        if not isinstance(spike, dict):
+            continue
+        region = spike.get("region", "Unknown")
+        vol_z = float(spike.get("volume_z", 0) or 0)
+        tone_z = float(spike.get("tone_z", 0) or 0)
+        severity = spike.get("severity", "moderate")
+
+        if "escalation_combo" in (spike.get("signals") or []):
+            anomalies.append(
+                f"GDELT escalation combo in {region}: volume spike {vol_z:+.1f}σ with negative tone {tone_z:+.1f}σ ({severity})"
+            )
+        elif vol_z >= 2.5:
+            anomalies.append(f"GDELT volume spike in {region}: {vol_z:+.1f}σ above baseline")
+        elif tone_z <= -2.0:
+            anomalies.append(f"GDELT tone shock in {region}: {tone_z:+.1f}σ (more negative)")
+
     return anomalies
 
 
@@ -910,6 +1213,352 @@ async def store_snapshot(intel: Dict[str, Any], cii_scores: List[Dict]):
         await conn.close()
 
 
+async def store_intel_stories(intel: Dict[str, Any]):
+    """Extract headline-level stories from intel data and store to intel_stories.
+    
+    This bridges the gap between WorldMonitor's 30-min refresh cycle and
+    the trading scripts (early_warning_scanner, bayesian_processor, conviction_tracker)
+    which all read from intel_stories.
+    
+    Sources extracted:
+    - GDELT GKG articles (geopolitical headlines)
+    - UCDP conflict events (armed conflict data)
+    - GDACS disasters (orange/red alerts)
+    - Significant earthquakes (M5.5+)
+    - Polymarket odds shifts (large moves)
+    - Convergence zones & anomalies
+    - Brave News headlines (fresh geopolitical news)
+    """
+    import asyncpg
+
+    db_url = get_db_connection()
+    if not db_url:
+        return
+
+    conn = await asyncpg.connect(db_url)
+    stories_inserted = 0
+
+    try:
+        today = datetime.now(timezone.utc).date()
+
+        # Helper to classify region from text
+        def classify_region(text: str) -> str:
+            text_lower = text.lower()
+            for code, keywords in COUNTRY_KEYWORDS.items():
+                for kw in keywords:
+                    if kw in text_lower:
+                        return MONITORED_COUNTRIES.get(code, code)
+            return "Global"
+
+        # Helper to insert with dedup (skip if headline already exists in last 4 hours)
+        # Using time-window dedup instead of daily dedup so 30min refresh cycles
+        # can add genuinely new stories throughout the day.
+        async def insert_story(headline: str, summary: str, region: str,
+                               significance: str, category: str, confidence: str,
+                               source: str):
+            nonlocal stories_inserted
+            if not headline or len(headline.strip()) < 10:
+                return
+            headline = headline[:500]
+            summary = (summary or "")[:2000]
+
+            # Dedup: check if similar headline exists in the last 4 hours
+            existing = await conn.fetchval(
+                "SELECT COUNT(*) FROM intel_stories WHERE created_at > NOW() - INTERVAL '4 hours' AND headline ILIKE $1",
+                f"%{headline[:80]}%"
+            )
+            if existing and existing > 0:
+                return
+
+            await conn.execute("""
+                INSERT INTO intel_stories 
+                (region, headline, summary, significance, category, confidence,
+                 sources, is_new_development, briefing_date, reported_in_briefing)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, false)
+            """, region, headline, summary, significance, category, confidence,
+                 [source], today)
+            stories_inserted += 1
+
+        # 1. GDELT GKG articles — richest source of geopolitical headlines
+        for article in intel.get("gdelt_gkg", []):
+            title = article.get("title", "")
+            if not title:
+                continue
+            region = classify_region(title)
+            # GDELT articles are pre-filtered for military/conflict
+            await insert_story(
+                headline=title,
+                summary=f"Source: {article.get('domain', 'unknown')}",
+                region=region,
+                significance="moderate",
+                category="geopolitical",
+                confidence="medium",
+                source="GDELT"
+            )
+
+        # 1b. GDELT timeline spikes (TimelineVolRaw + TimelineTone)
+        gdelt_timeline = intel.get("gdelt_timeline", {})
+        timeline_spikes = gdelt_timeline.get("spikes", []) if isinstance(gdelt_timeline, dict) else []
+        for spike in timeline_spikes:
+            if not isinstance(spike, dict):
+                continue
+            region = spike.get("region", "Global")
+            signals = spike.get("signals", []) or []
+            vol_z = float(spike.get("volume_z", 0) or 0)
+            tone_z = float(spike.get("tone_z", 0) or 0)
+            tone_current = float(spike.get("tone_current", 0) or 0)
+
+            headline_parts = [f"GDELT timeline spike in {region}"]
+            if "volume_spike" in signals:
+                headline_parts.append(f"volume {vol_z:+.1f}σ")
+            if "tone_negative_shift" in signals:
+                headline_parts.append(f"tone {tone_z:+.1f}σ")
+            elif "tone_positive_shift" in signals:
+                headline_parts.append(f"tone improving {tone_z:+.1f}σ")
+
+            summary = (
+                f"Signals={','.join(signals) if signals else 'none'} | "
+                f"volume_z={vol_z:+.2f}, tone_z={tone_z:+.2f}, tone_current={tone_current:+.2f}"
+            )
+
+            significance = "high" if spike.get("severity") == "high" else "moderate"
+            confidence = "high" if abs(vol_z) >= 2.5 or abs(tone_z) >= 2.0 else "medium"
+            category = "geopolitical" if region != "Cyber" else "cyber"
+
+            await insert_story(
+                headline=" — ".join(headline_parts),
+                summary=summary,
+                region=region,
+                significance=significance,
+                category=category,
+                confidence=confidence,
+                source="GDELT_TIMELINE"
+            )
+
+        # 2. UCDP conflict events
+        for event in intel.get("ucdp_conflicts", []):
+            country = event.get("country", "Unknown")
+            deaths = event.get("deaths_low", 0) or 0
+            side_a = event.get("side_a", "")
+            side_b = event.get("side_b", "")
+            headline = f"Armed conflict in {country}: {side_a} vs {side_b}"
+            significance = "critical" if deaths >= 50 else "high" if deaths >= 10 else "moderate"
+            await insert_story(
+                headline=headline,
+                summary=f"Deaths (est.): {deaths}. Date: {event.get('event_date', 'unknown')}",
+                region=country,
+                significance=significance,
+                category="conflict",
+                confidence="high",
+                source="UCDP"
+            )
+
+        # 3. GDACS disasters (orange/red)
+        for disaster in intel.get("disasters", []):
+            name = disaster.get("name", "Unknown disaster")
+            country = disaster.get("country", "Unknown")
+            alert = disaster.get("alert_level", "orange")
+            headline = f"GDACS {alert.upper()} alert: {name} in {country}"
+            await insert_story(
+                headline=headline,
+                summary=f"Type: {disaster.get('type', '?')}. Date: {disaster.get('date', 'unknown')}",
+                region=country,
+                significance="critical" if alert == "Red" else "high",
+                category="disaster",
+                confidence="high",
+                source="GDACS"
+            )
+
+        # 4. Significant earthquakes (M5.5+)
+        for quake in intel.get("earthquakes", []):
+            mag = quake.get("magnitude", 0) or 0
+            if mag < 5.5:
+                continue
+            place = quake.get("place", "Unknown location")
+            headline = f"M{mag:.1f} earthquake near {place}"
+            await insert_story(
+                headline=headline,
+                summary=f"Depth: {quake.get('depth_km', '?')}km. Alert: {quake.get('alert', 'none')}. Tsunami: {'yes' if quake.get('tsunami') else 'no'}",
+                region=classify_region(place),
+                significance="critical" if mag >= 7.0 else "high" if mag >= 6.0 else "moderate",
+                category="disaster",
+                confidence="high",
+                source="USGS"
+            )
+
+        # 5. OpenSky conflict zone anomalies (unusual aircraft counts)
+        for zone, data in intel.get("opensky_air", {}).items():
+            if isinstance(data, dict) and data.get("aircraft_count", 0) > 50:
+                count = data["aircraft_count"]
+                headline = f"High aircraft activity in {zone} conflict zone: {count} aircraft detected"
+                await insert_story(
+                    headline=headline,
+                    summary=f"OpenSky Network live tracking in {zone} bounding box",
+                    region=classify_region(zone),
+                    significance="moderate",
+                    category="military",
+                    confidence="medium",
+                    source="OpenSky"
+                )
+
+        # 6. Convergence zones (multiple sources pointing at same region)
+        for conv in intel.get("convergence", []):
+            if isinstance(conv, str):
+                region = classify_region(conv)
+                await insert_story(
+                    headline=f"Convergence alert: {conv}",
+                    summary="Multiple independent data sources showing correlated signals in this region",
+                    region=region,
+                    significance="high",
+                    category="convergence",
+                    confidence="high",
+                    source="WorldMonitor"
+                )
+
+        # 7. Anomalies
+        for anomaly in intel.get("anomalies", []):
+            if isinstance(anomaly, str):
+                region = classify_region(anomaly)
+                await insert_story(
+                    headline=f"Anomaly detected: {anomaly}",
+                    summary="Statistical anomaly vs. 7-day rolling average",
+                    region=region,
+                    significance="moderate",
+                    category="anomaly",
+                    confidence="medium",
+                    source="WorldMonitor"
+                )
+
+        # 8. Brave News — expanded rotating queries for continuous refresh
+        # Uses hour-based rotation so each 30min cycle gets different queries
+        brave_key = os.environ.get("BRAVE_SEARCH_API_KEY") or os.environ.get("BRAVE_API_KEY")
+        if brave_key:
+            # Full query pool — 20 diverse queries across regions and categories
+            all_brave_queries = [
+                # Core geopolitical (always high-value)
+                ("Iran military strike nuclear sanctions", "Iran", "geopolitical"),
+                ("Russia Ukraine war offensive ceasefire", "Russia/Ukraine", "geopolitical"),
+                ("China Taiwan military tension", "China/Taiwan", "geopolitical"),
+                ("North Korea missile nuclear ICBM", "North Korea", "geopolitical"),
+                ("Israel Gaza Hezbollah Lebanon strike", "Middle East", "geopolitical"),
+                # Expanded geopolitical
+                ("Syria conflict humanitarian crisis", "Syria", "geopolitical"),
+                ("Yemen Houthi Red Sea shipping attack", "Yemen", "geopolitical"),
+                ("NATO military deployment Europe", "Global", "geopolitical"),
+                ("India Pakistan Kashmir border tension", "South Asia", "geopolitical"),
+                ("Venezuela political crisis Maduro", "Venezuela", "geopolitical"),
+                # Economics & markets
+                ("Federal Reserve interest rate inflation", "United States", "economic"),
+                ("oil price OPEC production cut supply", "Global", "economic"),
+                ("global recession GDP economic downturn", "Global", "economic"),
+                ("sanctions trade war tariff economic", "Global", "economic"),
+                # Cyber & security
+                ("cyberattack infrastructure ransomware state", "Global", "cyber"),
+                ("election interference disinformation campaign", "Global", "information"),
+                # Energy & resources
+                ("energy crisis power grid nuclear plant", "Global", "energy"),
+                ("Strait of Hormuz shipping disruption", "Middle East", "geopolitical"),
+                # Humanitarian
+                ("refugee crisis displacement humanitarian emergency", "Global", "humanitarian"),
+                # Domestic US (relevant for Polymarket)
+                ("US military deployment troops Pentagon", "United States", "geopolitical"),
+            ]
+
+            # Rotate: pick 8 queries based on current hour (ensures variety across 30min runs)
+            current_hour = datetime.now(timezone.utc).hour
+            half_hour = 1 if datetime.now(timezone.utc).minute >= 30 else 0
+            rotation_index = (current_hour * 2 + half_hour) % len(all_brave_queries)
+            # Select 8 queries starting from rotation point, wrapping around
+            selected_queries = []
+            for i in range(8):
+                idx = (rotation_index + i * 3) % len(all_brave_queries)
+                selected_queries.append(all_brave_queries[idx])
+
+            # Use freshness=ph (past hour) to get truly fresh content each cycle
+            for query, region, category in selected_queries:
+                try:
+                    params = urllib.parse.urlencode({
+                        "q": query,
+                        "count": 5,
+                        "freshness": "ph",  # Past hour for fresh results
+                    })
+                    url = f"https://api.search.brave.com/res/v1/news/search?{params}"
+                    req = urllib.request.Request(url, headers={
+                        "Accept": "application/json",
+                        "X-Subscription-Token": brave_key,
+                    })
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        data = resp.read()
+                        if resp.headers.get("Content-Encoding") == "gzip":
+                            import gzip
+                            data = gzip.decompress(data)
+                        result = json.loads(data)
+
+                    for article in result.get("results", [])[:3]:
+                        headline = article.get("title", "")
+                        description = article.get("description", "")
+                        if headline:
+                            await insert_story(
+                                headline=headline,
+                                summary=description[:500],
+                                region=region,
+                                significance="moderate",
+                                category=category,
+                                confidence="medium",
+                                source="BraveNews"
+                            )
+                except Exception as e:
+                    print(f"  ⚠️ Brave News scan failed for {region}: {e}", file=sys.stderr)
+
+            # Fallback: if past-hour returned nothing, try past-day with DIFFERENT queries
+            # Use offset rotation so fallback queries don't overlap with main queries
+            if stories_inserted == 0:
+                print("  ℹ️ No fresh stories from past hour, trying past-day fallback...", file=sys.stderr)
+                fallback_offset = (rotation_index + 10) % len(all_brave_queries)
+                fallback_queries = [all_brave_queries[(fallback_offset + i) % len(all_brave_queries)] for i in range(5)]
+                for query, region, category in fallback_queries:
+                    try:
+                        params = urllib.parse.urlencode({
+                            "q": query, "count": 5, "freshness": "pd",
+                        })
+                        url = f"https://api.search.brave.com/res/v1/news/search?{params}"
+                        req = urllib.request.Request(url, headers={
+                            "Accept": "application/json",
+                            "X-Subscription-Token": brave_key,
+                        })
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            data = resp.read()
+                            if resp.headers.get("Content-Encoding") == "gzip":
+                                import gzip
+                                data = gzip.decompress(data)
+                            result = json.loads(data)
+                        for article in result.get("results", [])[:3]:
+                            headline = article.get("title", "")
+                            description = article.get("description", "")
+                            if headline:
+                                await insert_story(
+                                    headline=headline,
+                                    summary=description[:500],
+                                    region=region,
+                                    significance="moderate",
+                                    category=category,
+                                    confidence="medium",
+                                    source="BraveNews"
+                                )
+                    except Exception as e:
+                        print(f"  ⚠️ Brave News fallback failed for {region}: {e}", file=sys.stderr)
+
+        # Alert on low story count
+        if stories_inserted == 0:
+            print("  ⚠️ WARNING: 0 intel stories stored this cycle! Data may be stale.", file=sys.stderr)
+        print(f"  ✓ Stored {stories_inserted} intel stories to NeonDB", file=sys.stderr)
+
+    except Exception as e:
+        print(f"  ⚠️ store_intel_stories failed: {e}", file=sys.stderr)
+    finally:
+        await conn.close()
+
+
 async def get_historical_avg() -> Dict[str, float]:
     """Get 7-day rolling averages from NeonDB."""
     import asyncpg
@@ -1007,10 +1656,10 @@ def format_section(intel: Dict[str, Any]) -> str:
             lines.append(f"  ... +{len(nasa) - 4} more")
         lines.append("")
 
-    # NWS Weather Alerts (Configured Point)
+    # NWS Weather Alerts (Greenville SC)
     nws = intel.get("nws_alerts", [])
     if nws:
-        lines.append("🌪️ Weather Alerts (Configured Point)")
+        lines.append("🌪️ Weather Alerts (Greenville SC)")
         for alert in nws[:3]:
             severity = alert.get("severity", "")
             sev_emoji = "🔴" if severity == "Extreme" else "🟠" if severity == "Severe" else "🟡"
@@ -1067,6 +1716,24 @@ def format_section(intel: Dict[str, Any]) -> str:
                 else:
                     lines.append(f"  • {zone}: unavailable")
             lines.append("")
+
+    # GDELT Timeline Spikes (volume + tone)
+    gdelt_timeline = intel.get("gdelt_timeline", {})
+    spikes = gdelt_timeline.get("spikes", []) if isinstance(gdelt_timeline, dict) else []
+    if spikes:
+        lines.append("📡 GDELT Timeline Spikes")
+        for spike in spikes[:4]:
+            region = spike.get("region", "Global")
+            vol_z = float(spike.get("volume_z", 0) or 0)
+            tone_z = float(spike.get("tone_z", 0) or 0)
+            tone_cur = float(spike.get("tone_current", 0) or 0)
+            severity_emoji = "🔴" if spike.get("severity") == "high" else "🟠"
+            lines.append(
+                f"  {severity_emoji} {region}: vol {vol_z:+.1f}σ | tone {tone_z:+.1f}σ (current {tone_cur:+.1f})"
+            )
+        if len(spikes) > 4:
+            lines.append(f"  ... +{len(spikes) - 4} more")
+        lines.append("")
 
     # Prediction Markets
     polymarket = intel.get("polymarket", [])
@@ -1155,7 +1822,7 @@ def format_brief(intel: Dict[str, Any]) -> str:
     lines.append(format_section(intel))
     lines.append("")
     lines.append("━" * 50)
-    lines.append("Sources: USGS, GDACS, NASA EONET, CoinGecko, Alternative.me, Polymarket, UCDP, GDELT, UNHCR, Feodo, OpenSky, EIA, World Bank")
+    lines.append("Sources: USGS, GDACS, NASA EONET, CoinGecko, Alternative.me, Polymarket, UCDP, GDELT ArtList, GDELT TimelineVolRaw/TimelineTone, UNHCR, Feodo, OpenSky, EIA, World Bank")
     lines.append("Dashboard: worldmonitor.app")
     return "\n".join(lines)
 
@@ -1165,10 +1832,10 @@ def format_brief(intel: Dict[str, Any]) -> str:
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "--json"
 
-    print("WorldMonitor v2 Intelligence Engine — pulling from 17 sources...", file=sys.stderr)
+    print("WorldMonitor v2 Intelligence Engine — pulling from 18 sources...", file=sys.stderr)
 
     # Parallel fetch all sources
-    with ThreadPoolExecutor(max_workers=17) as executor:
+    with ThreadPoolExecutor(max_workers=18) as executor:
         futures = {
             executor.submit(fetch_earthquakes): "earthquakes",
             executor.submit(fetch_gdacs_disasters): "disasters",
@@ -1182,6 +1849,7 @@ def main():
             executor.submit(fetch_usa_spending): "usa_spending",
             executor.submit(fetch_open_meteo_climate): "climate",
             executor.submit(fetch_gdelt_gkg): "gdelt_gkg",
+            executor.submit(fetch_gdelt_timeline_signals): "gdelt_timeline",
             executor.submit(fetch_unhcr_displacement): "unhcr_displacement",
             executor.submit(fetch_feodo_tracker): "feodo_tracker",
             executor.submit(fetch_opensky_conflict_zones): "opensky_air",
@@ -1240,6 +1908,7 @@ def main():
     if mode == "--store":
         import asyncio
         asyncio.run(store_snapshot(intel, cii_scores))
+        asyncio.run(store_intel_stories(intel))
 
     # Output
     counts = {
@@ -1249,6 +1918,7 @@ def main():
         "polymarket": len(intel["polymarket"]),
         "ucdp_conflicts": len(intel["ucdp_conflicts"]),
         "gdelt_articles": len(intel["gdelt_gkg"]),
+        "gdelt_timeline_spikes": len(intel.get("gdelt_timeline", {}).get("spikes", [])) if isinstance(intel.get("gdelt_timeline"), dict) else 0,
         "unhcr": bool(intel.get("unhcr_displacement")),
         "feodo_c2": intel.get("feodo_tracker", {}).get("active_c2", 0),
         "opensky_zones": sum(1 for v in intel.get("opensky_air", {}).values() if v is not None),
